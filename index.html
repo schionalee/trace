@@ -327,6 +327,142 @@ async function readDxfFile(f,onProg){
   rest+=dec.decode();if(rest)R.line(rest);
   return R.finish();
 }
+/* ---------- PDF vectoriel ----------
+   pdf.js donne la liste des opérations de dessin : on suit la matrice courante, on aplatit les courbes en traits,
+   on repère les cercles (4 courbes à rayon constant) et les quarts pleins (remplissage qui touche le centre d'un cercle).
+   Les coordonnées sont gardées en millimètres papier ; l'échelle du plan les convertit en mètres. */
+const PDFJS='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+let pdfLib=null;
+function loadPdfJs(){
+  if(pdfLib)return pdfLib;
+  pdfLib=new Promise((res,rej)=>{
+    const s=document.createElement('script');s.src=PDFJS+'pdf.min.js';
+    s.onload=()=>{const L=window.pdfjsLib;if(!L)return rej(new Error('Lecteur PDF indisponible.'));L.GlobalWorkerOptions.workerSrc=PDFJS+'pdf.worker.min.js';res(L);};
+    s.onerror=()=>{pdfLib=null;rej(new Error('Impossible de charger le lecteur PDF. Vérifie la connexion Internet.'));};
+    document.head.appendChild(s);
+  });
+  return pdfLib;
+}
+const SCALES=[10,20,25,50,75,100,125,150,200,250,300,400,500,1000,2000];
+function scaleFromText(t){
+  const re=/1\s*[\/:]\s*(\d{2,4})(?!\d)/g;let m,best=null;
+  while((m=re.exec(t))){
+    const v=+m[1];if(!SCALES.includes(v))continue;
+    const before=t.slice(Math.max(0,m.index-20),m.index).toLowerCase();
+    if(/[ée]ch/.test(before))return v;
+    if(best===null)best=v;
+  }
+  return best;
+}
+async function readPdfFile(f,onProg,pageNo){
+  const lib=await loadPdfJs();
+  onProg&&onProg(10);
+  const doc=await lib.getDocument({data:new Uint8Array(await f.arrayBuffer())}).promise;
+  const n=doc.numPages,p=Math.min(Math.max(1,pageNo||1),n);
+  const page=await doc.getPage(p);
+  onProg&&onProg(30);
+  const ol=await page.getOperatorList();
+  onProg&&onProg(70);
+  let text='';
+  try{const tc=await page.getTextContent();text=tc.items.map(i=>i.str).join(' ');}catch(e){}
+  const raw=pdfOpsToRaw(ol,lib.OPS);
+  raw.pdf={numPages:n,page:p,scaleHint:scaleFromText(text)};
+  doc.destroy();
+  onProg&&onProg(100);
+  return raw;
+}
+function pdfOpsToRaw(ol,OPS){
+  const PT=25.4/72,segs=[],circles=[],fills=[];
+  let ctm=[1,0,0,1,0,0],stroke='#000000',fillC='#000000',path=[],cur=null,last=[0,0];
+  const stack=[];
+  const hex=a=>typeof a==='string'?a:'#'+[a[0],a[1],a[2]].map(v=>Math.round(v).toString(16).padStart(2,'0')).join('');
+  const tp=(x,y)=>[(ctm[0]*x+ctm[2]*y+ctm[4])*PT,(ctm[1]*x+ctm[3]*y+ctm[5])*PT];
+  const start=(x,y)=>{cur={pts:[tp(x,y)],curves:0,closed:false,o:[x,y]};path.push(cur);last=[x,y];};
+  const bez=(c1,c2,e)=>{
+    if(!cur)start(last[0],last[1]);
+    const p0=last;
+    for(let t=1;t<=6;t++){
+      const u=t/6,v=1-u;
+      cur.pts.push(tp(v*v*v*p0[0]+3*v*v*u*c1[0]+3*v*u*u*c2[0]+u*u*u*e[0],v*v*v*p0[1]+3*v*v*u*c1[1]+3*v*u*u*c2[1]+u*u*u*e[1]));
+    }
+    cur.curves++;last=e;
+  };
+  const PAINT={[OPS.stroke]:[0,1],[OPS.closeStroke]:[0,1],[OPS.fill]:[1,0],[OPS.eoFill]:[1,0],[OPS.fillStroke]:[1,1],
+    [OPS.eoFillStroke]:[1,1],[OPS.closeFillStroke]:[1,1],[OPS.closeEOFillStroke]:[1,1],[OPS.endPath]:[0,0]};
+  function emit(isFill,isStroke){
+    const ly=isStroke?'Traits '+stroke:'Remplissages '+fillC;
+    for(const s of path){
+      const p=s.pts;if(p.length<2)continue;
+      if(isFill||isStroke){
+        for(let i=0;i<p.length-1;i++)segs.push({x1:p[i][0],y1:p[i][1],x2:p[i+1][0],y2:p[i+1][1],layer:ly});
+        if(s.closed)segs.push({x1:p[p.length-1][0],y1:p[p.length-1][1],x2:p[0][0],y2:p[0][1],layer:ly});
+      }
+      let xs=0,ys=0,m=p.length;
+      if(m>2&&Math.hypot(p[m-1][0]-p[0][0],p[m-1][1]-p[0][1])<1e-6)m--;
+      for(let i=0;i<m;i++){xs+=p[i][0];ys+=p[i][1];}
+      const cx=xs/m,cy=ys/m;
+      // un cercle peut arriver en courbes de Bézier ou déjà découpé en petits traits (exports AutoCAD)
+      if((s.curves>=3||m>=16)&&m>=12){
+        let r=0;for(let i=0;i<m;i++)r+=Math.hypot(p[i][0]-cx,p[i][1]-cy);r/=m;
+        let ok=r>0;for(let i=0;i<m&&ok;i++)if(Math.abs(Math.hypot(p[i][0]-cx,p[i][1]-cy)-r)>0.06*r)ok=false;
+        if(ok&&(s.closed||Math.hypot(p[p.length-1][0]-p[0][0],p[p.length-1][1]-p[0][1])<0.1*r))circles.push({x:cx,y:cy,r});
+      }
+      if(isFill){
+        let a=1e300,b=1e300,c=-1e300,d=-1e300;
+        for(const q of p){if(q[0]<a)a=q[0];if(q[1]<b)b=q[1];if(q[0]>c)c=q[0];if(q[1]>d)d=q[1];}
+        if(Math.hypot(c-a,d-b)<60)fills.push({p,a,b,c,d});
+      }
+    }
+    path=[];cur=null;
+  }
+  const fn=ol.fnArray,ar=ol.argsArray;
+  for(let i=0;i<fn.length;i++){
+    const op=fn[i],a=ar[i];
+    if(op===OPS.save)stack.push([ctm,stroke,fillC]);
+    else if(op===OPS.restore){if(stack.length)[ctm,stroke,fillC]=stack.pop();}
+    else if(op===OPS.transform)ctm=mMul(ctm,a);
+    else if(op===OPS.paintFormXObjectBegin){stack.push([ctm,stroke,fillC]);if(a&&a[0])ctm=mMul(ctm,a[0]);}
+    else if(op===OPS.paintFormXObjectEnd){if(stack.length)[ctm,stroke,fillC]=stack.pop();}
+    else if(op===OPS.setStrokeRGBColor)stroke=hex(a);
+    else if(op===OPS.setFillRGBColor)fillC=hex(a);
+    else if(op===OPS.constructPath){
+      const sub=a[0],v=a[1];let j=0;
+      for(const s of sub){
+        if(s===OPS.moveTo){start(v[j],v[j+1]);j+=2;}
+        else if(s===OPS.lineTo){if(!cur)start(last[0],last[1]);cur.pts.push(tp(v[j],v[j+1]));last=[v[j],v[j+1]];j+=2;}
+        else if(s===OPS.curveTo){bez([v[j],v[j+1]],[v[j+2],v[j+3]],[v[j+4],v[j+5]]);j+=6;}
+        else if(s===OPS.curveTo2){bez(last,[v[j],v[j+1]],[v[j+2],v[j+3]]);j+=4;}
+        else if(s===OPS.curveTo3){const e=[v[j+2],v[j+3]];bez([v[j],v[j+1]],e,e);j+=4;}
+        else if(s===OPS.closePath){if(cur){cur.closed=true;last=cur.o;}}
+        else if(s===OPS.rectangle){const x=v[j],y=v[j+1],w=v[j+2],h=v[j+3];j+=4;
+          start(x,y);cur.pts.push(tp(x+w,y),tp(x+w,y+h),tp(x,y+h));cur.closed=true;last=[x,y];}
+      }
+    }
+    else if(PAINT[op]){const f=PAINT[op];emit(!!f[0],!!f[1]);}
+  }
+  // cercles en double (trait + remplissage) : un seul par centre et rayon
+  const seen=new Map();
+  for(const c of circles){const k=Math.round(c.x*20)+','+Math.round(c.y*20)+','+Math.round(c.r*20);if(!seen.has(k))seen.set(k,c);}
+  const uniq=[...seen.values()],grid=new Map(),cell=5;
+  uniq.forEach(c=>{const k=Math.floor(c.x/cell)+','+Math.floor(c.y/cell);if(!grid.has(k))grid.set(k,[]);grid.get(k).push(c);});
+  for(const f of fills){
+    const gx=Math.floor((f.a+f.c)/2/cell),gy=Math.floor((f.b+f.d)/2/cell);
+    for(let dx=-2;dx<=2;dx++)for(let dy=-2;dy<=2;dy++)for(const c of grid.get((gx+dx)+','+(gy+dy))||[]){
+      if(c.sym)continue;
+      let near=false,inside=true;
+      for(const q of f.p){const d=Math.hypot(q[0]-c.x,q[1]-c.y);if(d>c.r*1.1){inside=false;break;}if(d<c.r*0.15)near=true;}
+      if(inside&&near)c.sym=true;
+    }
+  }
+  const cands=[];let nSym=0;
+  for(const c of uniq){
+    if(c.sym){cands.push({x:c.x,y:c.y,z:0,r:0,layer:'PDF',kind:'INSERT',block:'cercle à quarts',sym:true});nSym++;}
+    else cands.push({x:c.x,y:c.y,z:0,r:0,layer:'Cercles Ø '+(c.r*2).toFixed(1).replace('.',',')+' mm',kind:'CIRCLE'});
+  }
+  return packRaw(cands,segs,nSym?{sym:{n:nSym,nested:0,names:[]}}:{});
+}
+/* Facteur pour passer des unités du fichier aux mètres. */
+const kOf=P=>P.kind==='pdf'?(P.pdfScale||100)*0.001:UNITS[P.unitKey];
 /* Plans fabriqués (CSV, exemple) : même format que la sortie du lecteur DXF. */
 function packRaw(cands,segs,extra){
   const lyNames=[],idx={},n=segs.length,seg=new Float64Array(n*4),segLy=new Uint16Array(n);
@@ -364,7 +500,7 @@ function coreOf(raw){
   if(!xs.length)return null;
   const q=(a,p)=>a[Math.min(a.length-1,Math.max(0,Math.floor(a.length*p)))];
   xs.sort((a,b)=>a-b);ys.sort((a,b)=>a-b);
-  const lo=xs.length>50?0.02:0,hi=xs.length>50?0.98:1-1e-12;
+  const lo=xs.length>2000?0.02:0,hi=xs.length>2000?0.98:1-1e-12;
   return{minx:q(xs,lo),miny:q(ys,lo),maxx:q(xs,hi),maxy:q(ys,hi)};
 }
 /* Unité : on croit l'en-tête $INSUNITS seulement si la salle obtenue a une taille réaliste (5 m à 2 km). */
@@ -425,7 +561,7 @@ function parseNum(s){const m=String(s).replace(',','.').match(/-?\d+(?:\.\d+)?/)
 
 const $=s=>document.querySelector(s);
 const KP='implantation-salle-plan-v1',KS='implantation-salle-etat-v2';
-const S={P:null,step:3,pick:'A',refs:{A:null,B:null},corr:{A:0,B:0},tol:3,ru:'m',order:'path',cur:0,done:{},rd:{},view:{cx:0,cy:0,s:10},msgs:[],journal:'',loading:null,gq:'',openLy:{}};
+const S={P:null,step:3,pick:'A',refs:{A:null,B:null},corr:{A:0,B:0},tol:3,ru:'m',order:'path',cur:0,done:{},rd:{},view:{cx:0,cy:0,s:10},msgs:[],journal:'',loading:null,gq:'',openLy:{},cal:null,pdfFile:null};
 let D=null,hoverSeg=-1;
 const cv=$('#cv'),ctx=cv.getContext('2d'),panel=$('#panel');
 let dpr=1;
@@ -458,7 +594,7 @@ function loadExample(){
   S.step=3;
 }
 function derive(){
-  const P=S.P,raw=P.raw,k=UNITS[P.unitKey],use=new Set(P.use);
+  const P=S.P,raw=P.raw,k=kOf(P),use=new Set(P.use);
   const pts=[],seen=new Set();let dup=0;
   raw.cands.forEach(c=>{
     const g=gkey(c);if(!use.has(g))return;
@@ -537,23 +673,32 @@ function setProgress(p){
   if(b)b.style.width=p+'%';
   if(t)t.textContent=p+' %';
 }
-async function loadFile(f){
+async function loadFile(f,page){
   const name=f.name,low=name.toLowerCase();
-  S.loading={name,pct:0,mb:f.size/1e6};S.msgs=[];renderAll();
+  S.loading={name,pct:0,mb:f.size/1e6};S.msgs=[];S.cal=null;renderAll();
   try{
     if(low.endsWith('.dwg'))throw new Error('Les fichiers DWG ne sont pas lus. Enregistre le plan au format DXF depuis ton logiciel de dessin.');
     let raw,kind;
     if(low.endsWith('.dxf')){raw=await readDxfFile(f,setProgress);kind='dxf';}
+    else if(low.endsWith('.pdf')){
+      raw=await readPdfFile(f,setProgress,page);kind='pdf';S.pdfFile=f;
+      if(!raw.nSeg)throw new Error('Ce PDF ne contient pas de traits lisibles : c’est sans doute un scan (une image). Il faut un PDF vectoriel, exporté depuis le logiciel de dessin.');
+      if(!raw.cands.length)throw new Error('Aucun cercle trouvé dans ce PDF. Les points d’accroche doivent être dessinés en cercles (symbole à quarts ou cercle simple).');
+    }
     else{raw=parseCsv(await f.text());kind='csv';}
     if(!raw.cands.length)throw new Error('Aucun point trouvé. Les points d’accroche doivent être des POINT, des blocs (INSERT) ou des cercles.');
-    const au=autoUnit(raw);
+    const au=kind==='pdf'?{u:'m'}:autoUnit(raw);
     const P={name,kind,raw,unitKey:au.u,detected:au.u,use:defaultUse(raw),hideLy:[]};
+    if(kind==='pdf'){P.pdfScale=raw.pdf.scaleHint||100;P.scaleSrc=raw.pdf.scaleHint?'cartouche':'défaut';}
     const refs=raw.nSeg?{A:null,B:null}:{A:{ax:'x',v:0},B:{ax:'y',v:0}};
     S.loading=null;
     setProject(P,refs);
     S.step=1;
     const m=[];
-    if(raw.sym&&raw.sym.n)m.push({lvl:'ok',text:raw.sym.n+' symboles d’accroche trouvés (cercle à quarts : '+raw.sym.names.join(', ')+')'+(raw.sym.nested?', dont '+raw.sym.nested+' à l’intérieur d’autres blocs':'')+'. Ils sont cochés ci-dessous, sauf ceux des calques « à supprimer ».'});
+    if(raw.sym&&raw.sym.n)m.push({lvl:'ok',text:raw.sym.n+' symboles d’accroche trouvés (cercle à quarts'+(raw.sym.names.length?' : '+raw.sym.names.join(', '):'')+')'+(raw.sym.nested?', dont '+raw.sym.nested+' à l’intérieur d’autres blocs':'')+'. Ils sont cochés ci-dessous, sauf ceux des calques « à supprimer ».'});
+    if(kind==='pdf')m.push(raw.pdf.scaleHint
+      ?{lvl:'warn',text:'Échelle 1:'+raw.pdf.scaleHint+' lue sur le plan. Vérifie-la en calibrant sur une cote connue avant d’implanter.'}
+      :{lvl:'bad',text:'Échelle introuvable dans le PDF : 1:100 par défaut. Saisis l’échelle ou calibre sur une cote connue, sinon les distances seront fausses.'});
     if(au.note)m.push({lvl:'warn',text:au.note});
     if(raw.ignored)m.push({lvl:'warn',text:raw.ignored+' éléments du fichier ne sont pas lus (textes, arcs, hachures).'});
     if(raw.oddExtr)m.push({lvl:'warn',text:raw.oddExtr+' éléments sont dessinés dans un plan incliné : leur position peut être fausse.'});
@@ -584,7 +729,7 @@ function checks(){
 /* ---------- Vues du panneau ---------- */
 function extentText(){
   const b=S.P.raw.core;if(!b)return'—';
-  const k=UNITS[S.P.unitKey];
+  const k=kOf(S.P);
   return f1((b.maxx-b.minx)*k)+' × '+f1((b.maxy-b.miny)*k)+' m';
 }
 function msgHtml(){return S.msgs.map(m=>`<div class="callout ${m.lvl}">${esc(m.text)}</div>`).join('');}
@@ -629,6 +774,27 @@ function wallLayersHtml(){
     <div class="layers">${ls.map(([n,c])=>`<label class="layer"><input type="checkbox" data-wl="${esc(n)}" ${hide.has(n)?'':'checked'}><span class="nm">${esc(n)}</span><span class="mono muted small">${c.SEG}</span></label>`).join('')}</div>
   </details>`;
 }
+/* Échelle d'un PDF : lue sur le plan, saisie, ou calculée à partir d'une cote connue touchée sur le plan. */
+function scaleHtml(){
+  const P=S.P,pg=P.raw.pdf||{},c=S.cal;
+  const src={cartouche:'lue sur le plan',défaut:'par défaut, à vérifier',saisi:'saisie',calibré:'calibrée sur une cote'}[P.scaleSrc]||'';
+  let cal;
+  if(!c)cal=`<button class="btn" data-a="cal">Calibrer sur une cote connue</button>`;
+  else if(!c.b)cal=`<div class="callout warn">Touche sur le plan ${c.a?'la <b>fin</b>':'le <b>début</b>'} d’une cote dont tu connais la longueur. Le point s’accroche au bout de trait le plus proche.</div>
+    <button class="btn" data-a="calx">Annuler</button>`;
+  else{
+    const d=Math.hypot(c.b[0]-c.a[0],c.b[1]-c.a[1]);
+    cal=`<label class="f">Longueur réelle de cette cote (m) · ${f1(d)} mm sur le papier
+      <input class="inp" id="calL" type="text" inputmode="decimal" placeholder="ex. 12,50"></label>
+      <div class="row"><button class="btn primary" data-a="calok">Appliquer l’échelle</button><button class="btn" data-a="calx">Annuler</button></div>`;
+  }
+  return `<div class="wall">
+    <label class="f">Échelle du plan, 1 : … (${src})
+      <input class="inp" id="pdfsc" type="number" min="1" step="any" value="${+(+P.pdfScale).toFixed(2)}"></label>
+    ${cal}
+    ${S.pdfFile&&pg.numPages>1?`<label class="f">Page du PDF<select id="pdfpg">${Array.from({length:pg.numPages},(_,i)=>`<option value="${i+1}" ${i+1===pg.page?'selected':''}>Page ${i+1}</option>`).join('')}</select></label>`:''}
+  </div>`;
+}
 function viewImport(){
   const P=S.P;
   return `
@@ -636,8 +802,8 @@ function viewImport(){
   ${P.kind==='example'?`<div class="callout warn"><b>Plan d’exemple.</b> Salle de 60 × 30 m avec 15 points. Charge ton fichier pour le remplacer.</div>`:''}
   ${msgHtml()}
   <div class="row">
-    <label class="btn primary" for="file">Choisir un fichier DXF ou CSV</label>
-    <input id="file" class="sr" type="file" accept=".dxf,.csv,.txt">
+    <label class="btn primary" for="file">Choisir un fichier DXF, PDF ou CSV</label>
+    <input id="file" class="sr" type="file" accept=".dxf,.pdf,.csv,.txt,application/pdf">
     <button class="btn" data-a="example">Charger l’exemple</button>
   </div>
   <dl class="meta">
@@ -646,17 +812,17 @@ function viewImport(){
     <dt>Murs (segments)</dt><dd>${P.raw.nSeg.toLocaleString('fr-FR')}</dd>
     <dt>Taille du plan</dt><dd>${extentText()}</dd>
   </dl>
-  <label class="f">Unité du fichier${P.unitKey===P.detected?' (détectée)':''}
+  ${P.kind==='pdf'?scaleHtml():`<label class="f">Unité du fichier${P.unitKey===P.detected?' (détectée)':''}
     <select id="unit">${['mm','cm','m'].map(u=>`<option value="${u}" ${u===P.unitKey?'selected':''}>${u}</option>`).join('')}</select>
   </label>
-  <p class="small muted" style="margin:-6px 0 0">Compare la taille du plan avec ta salle. Si elle est fausse, change l’unité.</p>
+  <p class="small muted" style="margin:-6px 0 0">Compare la taille du plan avec ta salle. Si elle est fausse, change l’unité.</p>`}
   <div>
     <div class="small muted" style="margin-bottom:6px">Points d’accroche : coche les calques, ou ouvre un calque (▾) pour choisir ses blocs</div>
     ${D.groups.size>8?`<input class="inp" id="gq" type="search" placeholder="Filtrer : levage, accroche…" value="${esc(S.gq)}" style="margin-bottom:8px">`:''}
     <div class="layers" id="grp">${grpHtml()}</div>
   </div>
   ${wallLayersHtml()}
-  <p class="small muted" style="margin:0">Pour le symbole d’accroche, le point retenu est le centre du cercle, même s’il est rangé dans un autre bloc. Pour les autres blocs, c’est leur point d’insertion. Fichier CSV : une ligne par point, <span class="mono">nom;x;y;z</span>. Les DWG ne sont pas lus : exporte en DXF.</p>
+  <p class="small muted" style="margin:0">Pour le symbole d’accroche, le point retenu est le centre du cercle, même s’il est rangé dans un autre bloc. Pour les autres blocs, c’est leur point d’insertion. PDF : il doit être vectoriel (exporté depuis le logiciel de dessin, pas scanné), et son échelle doit être juste. Fichier CSV : une ligne par point, <span class="mono">nom;x;y;z</span>. Les DWG ne sont pas lus : exporte en DXF.</p>
   <button class="btn primary" data-a="go2" ${D.pts.length?'':'disabled'}>Continuer vers les repères</button>`;
 }
 function wallCard(k){
@@ -744,8 +910,10 @@ function renderTabs(){
   });
   const hp=$('#pickhint');
   const picking=!S.loading&&S.step===2&&D&&D.nSeg>0;
-  hp.hidden=!picking;
+  const calib=!S.loading&&S.step===1&&S.cal&&!S.cal.b;
+  hp.hidden=!(picking||calib);
   if(picking)hp.innerHTML=`Touche le <b>mur ${S.pick}</b> sur le plan`;
+  else if(calib)hp.innerHTML=`Touche ${S.cal.a?'la <b>fin</b>':'le <b>début</b>'} de la cote`;
 }
 function renderPanel(){
   if(S.loading){panel.innerHTML=viewLoading();renderTabs();return;}
@@ -817,6 +985,11 @@ async function copyJournal(){
     const b=panel.querySelector('[data-a="copy"]');if(b)b.textContent='Journal copié';
   }catch(e){S.journal=txt;renderAll();const t=$('#jtxt');if(t){t.focus();t.select();}}
 }
+function setPdfScale(v,src){
+  S.P.pdfScale=Math.round(v*100)/100;S.P.scaleSrc=src;S.cal=null;S.done={};S.rd={};
+  S.msgs=S.msgs.filter(m=>!/[ÉE]chelle/.test(m.text));
+  derive();fitView();savePlan();renderAll();
+}
 function selectionChanged(){S.done={};S.rd={};S.cur=0;derive();savePlan();renderAll();}
 function setWallLayers(hide){S.P.hideLy=hide;hoverSeg=-1;derive();savePlan();renderAll();}
 panel.addEventListener('click',e=>{
@@ -834,6 +1007,13 @@ panel.addEventListener('click',e=>{
   else if(a==='copy')copyJournal();
   else if(a==='reset'){S.done={};S.rd={};S.cur=0;S.journal='';renderAll();}
   else if(a==='exp'){const l=b.dataset.ly;S.openLy[l]=!S.openLy[l];$('#grp').innerHTML=grpHtml();$('#grp').querySelectorAll('[data-ind]').forEach(el=>{el.indeterminate=true;});}
+  else if(a==='cal'){S.cal={a:null,b:null};renderAll();}
+  else if(a==='calx'){S.cal=null;renderAll();}
+  else if(a==='calok'){
+    const L=parseNum($('#calL').value),c=S.cal,d=Math.hypot(c.b[0]-c.a[0],c.b[1]-c.a[1]);
+    if(!(L>0)||!(d>0)){$('#calL').focus();return;}
+    setPdfScale(L*1000/d,'calibré');
+  }
   else if(a==='wlall')setWallLayers([]);
   else if(a==='wlnone')setWallLayers(Object.keys(S.P.raw.layers).filter(n=>S.P.raw.layers[n].SEG>0));
 });
@@ -849,6 +1029,8 @@ panel.addEventListener('keydown',e=>{
 panel.addEventListener('change',e=>{
   const t=e.target;
   if(t.id==='file'&&t.files[0]){loadFile(t.files[0]);return;}
+  if(t.id==='pdfsc'){const v=parseFloat(t.value);if(v>0)setPdfScale(v,'saisi');return;}
+  if(t.id==='pdfpg'&&S.pdfFile){loadFile(S.pdfFile,+t.value);return;}
   if(t.id==='unit'){S.P.unitKey=t.value;S.refs=S.P.raw.nSeg?S.refs:{A:{ax:'x',v:0},B:{ax:'y',v:0}};S.done={};S.rd={};derive();fitView();savePlan();renderAll();return;}
   if(t.dataset&&t.dataset.ly!=null){
     const set=new Set(S.P.use);
@@ -874,7 +1056,7 @@ $('#steps').addEventListener('click',e=>{const b=e.target.closest('button');if(b
 /* ---------- Plan : vue et dessin ---------- */
 function fitView(){
   if(!D)return;
-  const w=cv.clientWidth||600,h=cv.clientHeight||400,k=UNITS[S.P.unitKey],b=S.P.raw.core;
+  const w=cv.clientWidth||600,h=cv.clientHeight||400,k=kOf(S.P),b=S.P.raw.core;
   let a=1e300,bb=1e300,c=-1e300,d=-1e300;
   const add=(x,y)=>{if(x<a)a=x;if(y<bb)bb=y;if(x>c)c=x;if(y>d)d=y;};
   if(b){add(b.minx*k,b.miny*k);add(b.maxx*k,b.maxy*k);}
@@ -916,8 +1098,27 @@ function ptAt(sx,sy){
   D.seq.forEach((id,pos)=>{const p=D.pts[id],[x,y]=toScreen(p.x,p.y),d=Math.hypot(sx-x,sy-y);if(d<bd){bd=d;best=pos;}});
   return best;
 }
+/* Point du plan sous le doigt, accroché au bout de trait le plus proche (dans 14 px), en unités du fichier. */
+function snapAt(sx,sy){
+  const w=cv.clientWidth,h=cv.clientHeight,v=S.view,g=D.seg,ly=D.segLy,hid=D.lyHid;
+  let bx=v.cx+(sx-w/2)/v.s,by=v.cy-(sy-h/2)/v.s,bd=14;
+  for(let i=0;i<D.nSeg;i++){
+    if(hid[ly[i]])continue;
+    for(let e=0;e<2;e++){
+      const o=i*4+e*2,x=(g[o]-v.cx)*v.s+w/2,y=h/2-(g[o+1]-v.cy)*v.s,d=Math.abs(x-sx)+Math.abs(y-sy);
+      if(d<bd){bd=d;bx=g[o];by=g[o+1];}
+    }
+  }
+  const k=kOf(S.P);return[bx/k,by/k];
+}
 function onTap(sx,sy){
   if(S.loading||!D)return;
+  if(S.step===1&&S.cal&&!S.cal.b){
+    const p=snapAt(sx,sy);
+    if(!S.cal.a)S.cal.a=p;else S.cal.b=p;
+    renderAll();if(S.cal.b){const i=$('#calL');if(i)i.focus();}
+    return;
+  }
   if(S.step===2&&D.nSeg){
     const i=segAt(sx,sy);if(i<0)return;
     S.refs[S.pick]={si:i};
@@ -990,6 +1191,13 @@ function draw(){
       tag(k+' '+f3(cur['t'+k])+' m',(X(cur.x)+X(fx))/2,(Y(cur.y)+Y(fy))/2,colv);
     });
     tag(cur.name,X(cur.x),Y(cur.y)-24,C('--ink'));
+  }
+  // cote de calibrage
+  if(S.step===1&&S.cal&&S.cal.a){
+    const k=kOf(S.P),pa=S.cal.a,pb=S.cal.b;
+    ctx.strokeStyle=C('--accent');ctx.fillStyle=C('--accent');ctx.lineWidth=3;
+    if(pb){ctx.beginPath();ctx.moveTo(X(pa[0]*k),Y(pa[1]*k));ctx.lineTo(X(pb[0]*k),Y(pb[1]*k));ctx.stroke();}
+    [pa,pb].forEach(p=>{if(!p)return;ctx.beginPath();ctx.arc(X(p[0]*k),Y(p[1]*k),6,0,7);ctx.fill();});
   }
   // échelle
   const nice=[0.1,0.2,0.5,1,2,5,10,20,50,100,200,500,1000,2000,5000].find(n=>n*v.s>=70)||5000,len=nice*v.s,bx=14,by=h-16;
