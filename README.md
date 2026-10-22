@@ -10,6 +10,16 @@ Chaque point est repéré par sa distance perpendiculaire à deux murs de réfé
 2. **Repères** : touche deux murs du plan qui se coupent, et ajoute une correction en mm si le mur réel n'est pas à sa place sur le plan.
 3. **Implanter** : pour chaque point, saisis les deux distances mesurées. L'écart s'affiche en direct par rapport à la tolérance, et tu valides le point. Le journal s'exporte en CSV.
 
+## Mode télémètre
+
+Pour un télémètre Bluetooth en « mode clavier » (Leica DISTO X3/X4…) : active le mode à l'étape Implanter et touche le champ « Mesure reçue ». Chaque mesure tapée par le télémètre (suivie d'Entrée, de Tab ou de rien) va au mur actif :
+
+- mesure hors tolérance : bip grave, le mur reste actif, tu te décales et tu remesures ;
+- mesure bonne : bip aigu, on passe à l'autre mur ;
+- les deux bonnes : le point se valide seul (option) et on passe au suivant.
+
+Les mesures en m, cm ou mm sont reconnues, avec point ou virgule. Une annonce vocale (« Rapproche-toi du mur A de 4 centimètres ») peut être activée. Vibration sur Android.
+
 ## Ce que l'outil gère
 
 - Les gros DXF (plusieurs centaines de Mo), lus par morceaux.

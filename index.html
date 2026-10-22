@@ -128,6 +128,17 @@ details.set summary{cursor:pointer;font-weight:600;min-height:40px;display:flex;
 .prow .mk{font:700 15px var(--f-mono);color:var(--muted)}
 .prow.is-done .mk{color:var(--ok)}
 .prow.is-cur{background:var(--surface-2)}
+.tele{border:2px solid var(--accent);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:10px;background:var(--surface)}
+.tele-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.seg{display:flex;gap:4px;margin-left:auto}
+.seg button{min-width:46px;min-height:42px;border-radius:9px;border:1px solid var(--line);background:var(--surface);color:var(--ink);font:700 18px var(--f-display);cursor:pointer}
+.seg button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink);border-color:transparent}
+.seg button.b[aria-pressed="true"]{background:var(--wb);color:var(--wb-ink)}
+.capst{font:500 14px var(--f-mono);min-height:20px}
+.capst.ok{color:var(--ok)}.capst.off{color:var(--warn)}.capst.bad{color:var(--bad)}
+.axis.dim{opacity:.5}
+.chk{display:flex;align-items:center;gap:10px;min-height:44px;cursor:pointer}
+.chk input{width:20px;height:20px;accent-color:var(--accent)}
 textarea.ex{width:100%;min-height:120px;font:12px var(--f-mono);background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:8px}
 @media (prefers-reduced-motion:no-preference){.btn,.steps button{transition:background .12s}}
 </style>
@@ -561,7 +572,7 @@ function parseNum(s){const m=String(s).replace(',','.').match(/-?\d+(?:\.\d+)?/)
 
 const $=s=>document.querySelector(s);
 const KP='implantation-salle-plan-v1',KS='implantation-salle-etat-v2';
-const S={P:null,step:3,pick:'A',refs:{A:null,B:null},corr:{A:0,B:0},tol:3,ru:'m',order:'path',cur:0,done:{},rd:{},view:{cx:0,cy:0,s:10},msgs:[],journal:'',loading:null,gq:'',openLy:{},cal:null,pdfFile:null};
+const S={P:null,step:3,pick:'A',refs:{A:null,B:null},corr:{A:0,B:0},tol:3,ru:'m',order:'path',cur:0,done:{},rd:{},view:{cx:0,cy:0,s:10},msgs:[],journal:'',loading:null,gq:'',openLy:{},cal:null,pdfFile:null,tele:false,teleW:'A',teleAuto:true,teleVoice:false,capSt:null,capFocus:false};
 let D=null,hoverSeg=-1;
 const cv=$('#cv'),ctx=cv.getContext('2d'),panel=$('#panel');
 let dpr=1;
@@ -654,7 +665,7 @@ function savePlan(){
   saveState();
 }
 function saveState(){
-  try{localStorage.setItem(KS,JSON.stringify({refs:S.refs,corr:S.corr,tol:S.tol,ru:S.ru,order:S.order,cur:S.cur,done:S.done,rd:S.rd,step:S.step,pick:S.pick}));}catch(e){}
+  try{localStorage.setItem(KS,JSON.stringify({refs:S.refs,corr:S.corr,tol:S.tol,ru:S.ru,order:S.order,cur:S.cur,done:S.done,rd:S.rd,step:S.step,pick:S.pick,tele:S.tele,teleAuto:S.teleAuto,teleVoice:S.teleVoice}));}catch(e){}
 }
 async function restore(){
   try{
@@ -853,13 +864,91 @@ function viewRefs(){
   <button class="btn primary" data-a="go3" ${refsReady()&&!bad&&D.pts.length?'':'disabled'}>Passer à l’implantation</button>`;
 }
 function axisHtml(k,p){
-  return `<div class="axis">
+  return `<div class="axis ${S.tele&&S.teleW!==k?'dim':''}">
     <div class="axis-head"><span class="chip ${k==='B'?'b':''}">${k}</span><b>Mur ${k}</b>
       <span class="target">${f3(p['t'+k])}<small>m</small></span></div>
     <label class="f">Mesuré (${S.ru})
       <input class="inp big" id="r${k}" type="text" inputmode="decimal" autocomplete="off" enterkeyhint="${k==='A'?'next':'done'}" placeholder="0,000"></label>
     <div class="delta idle" id="d${k}"><span class="n">—</span><span class="t">Saisis la distance mesurée</span></div>
   </div>`;
+}
+/* ---------- Mode télémètre ----------
+   Le télémètre en Bluetooth « mode clavier » tape chaque mesure dans le champ qui a le focus, suivie d'Entrée ou de Tab
+   selon son réglage. Un seul champ reçoit tout : la mesure va au mur actif, qui passe de A à B quand elle est bonne,
+   et le point se valide seul quand les deux distances sont dans la tolérance. */
+function teleHtml(){
+  if(!S.tele)return `<button class="btn" data-a="tele">Activer le mode télémètre</button>`;
+  const st=S.capSt||{cls:'',txt:'Touche le champ ci-dessus, puis mesure avec le télémètre.'};
+  return `<div class="tele">
+    <div class="tele-head"><b>Mode télémètre</b><span class="small muted">prochaine mesure</span>
+      <div class="seg" role="group" aria-label="Mur à mesurer">
+        <button data-a="tw" data-w="A" aria-pressed="${S.teleW==='A'}">A</button>
+        <button class="b" data-a="tw" data-w="B" aria-pressed="${S.teleW==='B'}">B</button>
+      </div></div>
+    <label class="f">Mesure reçue · mur ${S.teleW}
+      <input class="inp big" id="cap" type="text" inputmode="decimal" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="done" placeholder="Touche ici, puis mesure"></label>
+    <div class="capst ${st.cls}" id="capst">${esc(st.txt)}</div>
+    <div class="row small">
+      <label class="chk"><input type="checkbox" id="tauto" ${S.teleAuto?'checked':''}>Valider seul</label>
+      <label class="chk"><input type="checkbox" id="tvoice" ${S.teleVoice?'checked':''}>Annonce vocale</label>
+      <button class="btn sm" data-a="tele" style="margin-left:auto">Quitter</button>
+    </div>
+  </div>`;
+}
+// Lit « 12.345 », « 12,345 m », « 12345 mm »… : on garde le dernier nombre et son unité s'il y en a une.
+function parseMeasure(s){
+  const re=/-?\d+(?:[.,]\d+)?/g;let m,last=null;
+  while((m=re.exec(s)))last=m;
+  if(!last)return NaN;
+  const v=parseFloat(last[0].replace(',','.'));
+  const u=(s.slice(last.index+last[0].length).match(/^\s*(mm|cm|m|ft|in|'|")/i)||[])[1];
+  const f=u?({mm:0.001,cm:0.01,m:1,ft:0.3048,"'":0.3048,in:0.0254,'"':0.0254}[u.toLowerCase()]):unitK();
+  return v*f;
+}
+let audio=null,teleTimer=0,capTimer=0;
+function beep(kind){
+  try{
+    audio=audio||new (window.AudioContext||window.webkitAudioContext)();
+    if(audio.state==='suspended')audio.resume();
+    const seq={ok:[[880,.09],[1320,.12]],off:[[330,.22]],done:[[660,.1],[880,.1],[1320,.18]],bad:[[220,.15],[220,.15]]}[kind]||[];
+    let t=audio.currentTime;
+    seq.forEach(([f,d])=>{const o=audio.createOscillator(),g=audio.createGain();o.frequency.value=f;o.type='sine';
+      g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.3,t+.01);g.gain.exponentialRampToValueAtTime(.0001,t+d);
+      o.connect(g).connect(audio.destination);o.start(t);o.stop(t+d+.02);t+=d+.04;});
+  }catch(e){}
+  try{if(navigator.vibrate)navigator.vibrate({ok:60,off:[40,60,40],done:[60,40,60,40,120],bad:200}[kind]||0);}catch(e){}
+}
+function say(txt){
+  if(!S.teleVoice||!window.speechSynthesis)return;
+  try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(txt);u.lang='fr-FR';u.rate=1.1;speechSynthesis.speak(u);}catch(e){}
+}
+const cmTxt=v=>{const c=Math.abs(v*100);return c>=100?(c/100).toFixed(1).replace('.',',').replace(',0','')+' mètres':c<10?f1(c).replace(',0','')+' centimètres':Math.round(c)+' centimètres';};
+function takeMeasure(text){
+  const p=curPt();if(!p||!refsReady())return;
+  const m=parseMeasure(text),k=S.teleW;
+  if(!(m>0)){S.capSt={cls:'bad',txt:'Mesure illisible : « '+text.trim().slice(0,30)+' »'};beep('bad');renderAll();return;}
+  clearTimeout(teleTimer);
+  const r=S.rd[p.id]||{a:NaN,b:NaN};r[k.toLowerCase()]=m;S.rd[p.id]=r;
+  const e=m-p['t'+k],ok=Math.abs(e*100)<=S.tol+1e-9;
+  S.capSt={cls:ok?'ok':'off',txt:k+' : '+f3(m)+' m · '+(ok?'bon':(e>0?'rapproche-toi':'éloigne-toi')+' de '+(Math.abs(e)>=1?Math.abs(e).toFixed(2).replace('.',',')+' m':f1(Math.abs(e*100))+' cm'))};
+  const other=k==='A'?'B':'A',ro=r[other.toLowerCase()],otherOk=fin(ro)&&Math.abs((ro-p['t'+other])*100)<=S.tol+1e-9;
+  if(!ok){beep('off');say((e>0?'Rapproche-toi':'Éloigne-toi')+' du mur '+k+' de '+cmTxt(e));}
+  else if(otherOk){
+    beep('ok');
+    if(S.teleAuto){
+      S.capSt.txt+=' · validation…';
+      const id=p.id;
+      teleTimer=setTimeout(()=>{
+        if(!curPt()||curPt().id!==id)return;
+        validate();S.teleW='A';beep('done');
+        const n=curPt();
+        S.capSt={cls:'ok',txt:'Point validé. Suivant : '+(n&&!S.done[n.id]?n.name:'aucun')};
+        say('Point validé.'+(n&&!S.done[n.id]?' Suivant, '+n.name:' Tous les points sont faits'));
+        renderAll();
+      },700);
+    }else{S.capSt.txt+=' · les deux murs sont bons, valide le point';say('Mur '+k+' bon. Tu peux valider');}
+  }else{beep('ok');S.teleW=other;say('Mur '+k+' bon. Mesure le mur '+other);}
+  renderAll();
 }
 function viewGuide(){
   if(!D.pts.length)return `<h2>Implanter</h2><div class="callout bad">Aucun point d’accroche dans le plan. Vérifie les calques à l’étape 1.</div><button class="btn" data-a="go1">Retour au plan</button>`;
@@ -879,6 +968,7 @@ function viewGuide(){
     <span class="muted small">tolérance ${f1(S.tol)} cm</span></div>
   <div class="bar"><i style="width:${Math.round(nd/n*100)}%"></i></div>
   ${allDone?`<div class="callout ok"><b>Tous les points sont implantés.</b> Copie le journal ci-dessous pour le garder.</div>`:''}
+  ${teleHtml()}
   <div class="cur">
     <div class="cur-head"><span class="cur-name">${esc(p.name)}</span>
       <span class="cur-meta">point ${S.cur+1}/${n}${hasZ?' · hauteur '+f3(p.z)+' m':''}</span></div>
@@ -924,6 +1014,7 @@ function renderPanel(){
     const p=curPt(),r=S.rd[p.id];
     if(r){const k=1/unitK();$('#rA').value=fin(r.a)?String(+(r.a*k).toFixed(4)).replace('.',','):'';$('#rB').value=fin(r.b)?String(+(r.b*k).toFixed(4)).replace('.',','):'';}
     updateDeltas();
+    const c=$('#cap');if(c&&S.capFocus)c.focus({preventScroll:true});
   }
   saveState();
 }
@@ -958,7 +1049,7 @@ function setStep(n){
   if(n===3&&!(refsReady()&&D.pts.length))return;
   S.step=n;S.journal='';renderAll();
 }
-function gotoPos(pos){S.cur=Math.max(0,Math.min(D.seq.length-1,pos));S.journal='';renderAll();centerOn(curPt());}
+function gotoPos(pos){S.cur=Math.max(0,Math.min(D.seq.length-1,pos));S.journal='';S.teleW='A';S.capSt=null;clearTimeout(teleTimer);renderAll();centerOn(curPt());}
 function validate(){
   const p=curPt();if(!p)return;
   updateDeltas();S.done[p.id]=true;
@@ -1007,6 +1098,8 @@ panel.addEventListener('click',e=>{
   else if(a==='copy')copyJournal();
   else if(a==='reset'){S.done={};S.rd={};S.cur=0;S.journal='';renderAll();}
   else if(a==='exp'){const l=b.dataset.ly;S.openLy[l]=!S.openLy[l];$('#grp').innerHTML=grpHtml();$('#grp').querySelectorAll('[data-ind]').forEach(el=>{el.indeterminate=true;});}
+  else if(a==='tele'){S.tele=!S.tele;S.teleW='A';S.capSt=null;S.capFocus=S.tele;clearTimeout(teleTimer);if(S.tele)beep('');renderAll();}
+  else if(a==='tw'){S.teleW=b.dataset.w;S.capFocus=true;renderAll();}
   else if(a==='cal'){S.cal={a:null,b:null};renderAll();}
   else if(a==='calx'){S.cal=null;renderAll();}
   else if(a==='calok'){
@@ -1017,11 +1110,24 @@ panel.addEventListener('click',e=>{
   else if(a==='wlall')setWallLayers([]);
   else if(a==='wlnone')setWallLayers(Object.keys(S.P.raw.layers).filter(n=>S.P.raw.layers[n].SEG>0));
 });
+// le champ de capture garde le focus d'un rendu à l'autre, jusqu'à ce qu'on touche un autre champ
+panel.addEventListener('focusin',e=>{
+  if(e.target.id==='cap'){S.capFocus=true;beep('');}
+  else if(e.target.matches('input,select,textarea'))S.capFocus=false;
+});
 panel.addEventListener('input',e=>{
+  // sans Entrée ni Tab après la mesure, on la prend quand le télémètre a fini de taper
+  if(e.target.id==='cap'){clearTimeout(capTimer);const t=e.target;capTimer=setTimeout(()=>{if(t.isConnected&&t.value.trim()){const v=t.value;t.value='';takeMeasure(v);}},600);return;}
   if(e.target.id==='rA'||e.target.id==='rB'){updateDeltas();saveState();}
   else if(e.target.id==='gq'){S.gq=e.target.value;$('#grp').innerHTML=grpHtml();$('#grp').querySelectorAll('[data-ind]').forEach(el=>{el.indeterminate=true;});}
 });
 panel.addEventListener('keydown',e=>{
+  if(e.target.id==='cap'&&(e.key==='Enter'||e.key==='Tab')){
+    e.preventDefault();clearTimeout(capTimer);
+    const v=e.target.value;e.target.value='';
+    if(v.trim())takeMeasure(v);
+    return;
+  }
   if(e.key!=='Enter')return;
   if(e.target.id==='rA'){e.preventDefault();$('#rB').focus();}
   else if(e.target.id==='rB'){e.preventDefault();$('#valid').focus();}
@@ -1029,6 +1135,8 @@ panel.addEventListener('keydown',e=>{
 panel.addEventListener('change',e=>{
   const t=e.target;
   if(t.id==='file'&&t.files[0]){loadFile(t.files[0]);return;}
+  if(t.id==='tauto'){S.teleAuto=t.checked;saveState();return;}
+  if(t.id==='tvoice'){S.teleVoice=t.checked;saveState();if(t.checked)say('Annonce vocale activée');return;}
   if(t.id==='pdfsc'){const v=parseFloat(t.value);if(v>0)setPdfScale(v,'saisi');return;}
   if(t.id==='pdfpg'&&S.pdfFile){loadFile(S.pdfFile,+t.value);return;}
   if(t.id==='unit'){S.P.unitKey=t.value;S.refs=S.P.raw.nSeg?S.refs:{A:{ax:'x',v:0},B:{ax:'y',v:0}};S.done={};S.rd={};derive();fitView();savePlan();renderAll();return;}
